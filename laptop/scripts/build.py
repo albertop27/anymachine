@@ -22,6 +22,8 @@ WIDTH = opt("--width", 0.32, float)
 LID_T = opt("--lid-t", 0.005, float)
 MAX_DEG = opt("--max-deg", 135.0, float)
 GAP = opt("--gap", 0.001, float)
+DECK_MAP = opt("--deck-map")  # fork: replace the patchy generated keyboard skin with a flat deck + projected 2D map
+DECK_BUMP = opt("--deck-bump", 0.35, float)
 report = {"gen": GEN, "glb": GLB}
 
 # ---------------------------------------------------------------- import, orient, scale (normalize.py logic)
@@ -309,6 +311,47 @@ kill = [f for f in bm.faces if f.calc_center_median().z < deck_z(f.calc_center_m
         or f.calc_center_median().y > y_cut - LID_T - 0.002 or abs(f.calc_center_median().x) > WIDTH / 2 - 0.002]
 bmesh.ops.delete(bm, geom=kill, context="FACES")
 report["skin_faces_kept"] = len(bm.faces)
+if DECK_MAP:
+    # owner note (run 005): the TRELLIS keyboard skin is patchy. Swap it for a flat skin that follows the fitted deck
+    # plane, carrying a top-down 2D keyboard map (UV = planar XY over the skin's footprint) plus a light bump from it.
+    sx = [v.co.x for v in bm.verts]; sy = [v.co.y for v in bm.verts]
+    fx0, fx1, fy0, fy1 = min(sx), max(sx), min(sy), max(sy)
+    bmesh.ops.delete(bm, geom=bm.verts[:], context="VERTS")
+    NX, NY = 64, 44
+    grid = [[bm.verts.new((fx0 + (fx1 - fx0) * i / NX, fy0 + (fy1 - fy0) * j / NY,
+                           deck_z(fy0 + (fy1 - fy0) * j / NY) + 0.0003)) for i in range(NX + 1)] for j in range(NY + 1)]
+    for _l in list(bm.loops.layers.uv):  # the generated UV layer would stay active and the map would never show
+        bm.loops.layers.uv.remove(_l)
+    uvl = bm.loops.layers.uv.new("UVMap")
+    for j in range(NY):
+        for i in range(NX):
+            f = bm.faces.new((grid[j][i], grid[j][i + 1], grid[j + 1][i + 1], grid[j + 1][i]))
+            for lp in f.loops:
+                lp[uvl].uv = ((lp.vert.co.x - fx0) / (fx1 - fx0), (lp.vert.co.y - fy0) / (fy1 - fy0))
+    dm = bpy.data.materials.new("deck_map")
+    dm.use_nodes = True
+    dnt = dm.node_tree
+    db = dnt.nodes["Principled BSDF"]
+    dt = dnt.nodes.new("ShaderNodeTexImage")
+    dt.image = bpy.data.images.load(os.path.abspath(DECK_MAP))
+    dt.image.pack()
+    dt.extension = "EXTEND"
+    dnt.links.new(dt.outputs["Color"], db.inputs["Base Color"])
+    inv = dnt.nodes.new("ShaderNodeInvert")
+    dnt.links.new(dt.outputs["Color"], inv.inputs["Color"])
+    bwn = dnt.nodes.new("ShaderNodeRGBToBW")
+    dnt.links.new(inv.outputs["Color"], bwn.inputs["Color"])
+    bp = dnt.nodes.new("ShaderNodeBump")
+    bp.inputs["Strength"].default_value = DECK_BUMP
+    bp.inputs["Distance"].default_value = 0.0008
+    dnt.links.new(bwn.outputs["Val"], bp.inputs["Height"])
+    dnt.links.new(bp.outputs["Normal"], db.inputs["Normal"])
+    db.inputs["Metallic"].default_value = 0.25
+    db.inputs["Roughness"].default_value = 0.5
+    base.data.materials.clear()
+    base.data.materials.append(dm)
+    report["deck_map"] = os.path.basename(DECK_MAP)
+    report["deck_map_footprint_m"] = [round(fx1 - fx0, 4), round(fy1 - fy0, 4)]
 # closed-pose clearance: the lid must sit above the tallest thing left on the deck (keytops, bumps), not the plane
 prot = max(v.co.z - deck_z(v.co.y) for v in bm.verts)
 gap = max(GAP, prot + 0.0005)

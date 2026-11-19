@@ -1,5 +1,5 @@
 """Stilt-walker (Design C): 30 m four-legged, two-armed strider. Hard-surface build, rig, animations, bake, export.
-Run:  blender.exe --background --python build_stilt.py -- [--no-bake] [--no-export] [--tex 4096]
+Run:  blender.exe --background --python build_stilt.py -- [--no-bake] [--no-export] [--tex 4096] [--wear 0..1] [--name stilt_worn]
 Everything is rebuilt from scratch on every run. Units are metres, +X forward, +Y left, +Z up.
 """
 import bpy, bmesh, sys, os, json, time
@@ -10,6 +10,7 @@ from mathutils import Vector, Matrix, Quaternion
 HERE = os.path.dirname(os.path.abspath(__file__))
 ARGS = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
 OUT = 'stilt'
+NAME = ARGS[ARGS.index('--name') + 1] if '--name' in ARGS else OUT  # fork: output name (blend/glb/fbx/info/textures)
 TEX_N = int(ARGS[ARGS.index('--tex') + 1]) if '--tex' in ARGS else 4096
 T0 = time.time()
 
@@ -594,6 +595,97 @@ mat(CAB, (0.032, 0.030, 0.028), 0.0, 0.68, noise=0.10, nscale=30.0, bump=0.3)
 mat(RUB, (0.018, 0.018, 0.018), 0.0, 0.90)
 mat(EMIT, (0.01, 0.02, 0.05), 0.0, 0.3, emit=BLUE, strength=6.0)
 BEV = {CER: 0.02, CARB: 0.018, MET: 0.014, STL: 0.006, CAB: 0.0, RUB: 0.01, EMIT: 0.0}
+
+
+def industrial_wear(m, amount):
+    """albertop27 fork: heavy-machinery wear layered over a material (owner: 'more roughness of large size machines').
+    Rust patches, vertical rain/oil streaks, dirt in crevices (pointiness), bright worn edges, rougher overall.
+    All inputs are rest_pos (metres) or geometry, so it bakes with the Cycles bake below."""
+    nt = m.node_tree
+    b = nt.nodes['Principled BSDF']
+    L = nt.links.new
+    col_in = b.inputs['Base Color']
+    src = col_in.links[0].from_socket if col_in.is_linked else None
+    base = tuple(col_in.default_value)
+    tc = nt.nodes.new('ShaderNodeAttribute'); tc.attribute_name = 'rest_pos'
+    geo = nt.nodes.new('ShaderNodeNewGeometry')
+
+    def noise(scale, detail, vec):
+        n = nt.nodes.new('ShaderNodeTexNoise')
+        n.inputs['Scale'].default_value = scale
+        n.inputs['Detail'].default_value = detail
+        L(vec, n.inputs['Vector'])
+        return n
+
+    def ramp(sock, lo, hi, a=0.0, z=1.0):
+        r = nt.nodes.new('ShaderNodeMapRange')
+        r.inputs['From Min'].default_value = lo; r.inputs['From Max'].default_value = hi
+        r.inputs['To Min'].default_value = a; r.inputs['To Max'].default_value = z
+        L(sock, r.inputs['Value'])
+        return r.outputs['Result']
+
+    def mix(fac, c1, c2, blend='MIX'):
+        x = nt.nodes.new('ShaderNodeMixRGB'); x.blend_type = blend
+        if isinstance(fac, float):
+            x.inputs['Fac'].default_value = fac
+        else:
+            L(fac, x.inputs['Fac'])
+        for i, c in ((1, c1), (2, c2)):
+            if isinstance(c, tuple):
+                x.inputs['Color%d' % i].default_value = c
+            else:
+                L(c, x.inputs['Color%d' % i])
+        return x.outputs['Color']
+
+    def mul(a, k):
+        x = nt.nodes.new('ShaderNodeMath'); x.operation = 'MULTIPLY'
+        L(a, x.inputs[0]); x.inputs[1].default_value = k
+        return x.outputs[0]
+
+    # rust patches: blotchy, scale ~1-2 m on a 30 m machine
+    rust_m = ramp(noise(0.7, 8.0, tc.outputs['Vector']).outputs['Fac'], 0.58 - 0.12 * amount, 0.70, 0, 1)
+    rust_c = mix(noise(6.0, 4.0, tc.outputs['Vector']).outputs['Fac'], (0.16, 0.055, 0.02, 1), (0.30, 0.12, 0.04, 1))
+    # vertical streaks: noise squashed in Z
+    mp = nt.nodes.new('ShaderNodeMapping'); mp.inputs['Scale'].default_value = (9.0, 9.0, 0.25)
+    L(tc.outputs['Vector'], mp.inputs['Vector'])
+    streak = ramp(noise(1.0, 6.0, mp.outputs['Vector']).outputs['Fac'], 0.52, 0.75, 0, 0.7)
+    # crevice dirt and worn edges from pointiness
+    dirt = ramp(geo.outputs['Pointiness'], 0.47, 0.5, 1, 0)
+    edge = ramp(geo.outputs['Pointiness'], 0.53, 0.58, 0, 1)
+    edge = mul(edge, 1.0)
+    c = src if src is not None else base
+    c = mix(mul(streak, amount), c, (0.05, 0.04, 0.03, 1), 'MULTIPLY')
+    c = mix(mul(dirt, 0.85 * amount), c, (0.035, 0.03, 0.025, 1))
+    c = mix(mul(rust_m, amount), c, rust_c)
+    c = mix(mul(edge, 0.6 * amount), c, (0.42, 0.41, 0.39, 1))
+    L(c, col_in)
+    # roughness: rougher overall, rust and dirt very rough, edges polished
+    r_in = b.inputs['Roughness']
+    r_src = r_in.links[0].from_socket if r_in.is_linked else None
+    add = nt.nodes.new('ShaderNodeMath'); add.operation = 'ADD'; add.use_clamp = True
+    if r_src is not None:
+        L(r_src, add.inputs[0])
+    else:
+        add.inputs[0].default_value = r_in.default_value
+    add.inputs[1].default_value = 0.18 * amount
+    rr = mix(rust_m, add.outputs[0], (0.9, 0.9, 0.9, 1))
+    rr = mix(mul(edge, 0.6 * amount), rr, (0.3, 0.3, 0.3, 1))
+    bw = nt.nodes.new('ShaderNodeRGBToBW'); L(rr, bw.inputs['Color'])
+    L(bw.outputs['Val'], r_in)
+    # rust kills metalness
+    if b.inputs['Metallic'].default_value > 0.1:
+        met = nt.nodes.new('ShaderNodeMath'); met.operation = 'MULTIPLY'
+        inv = ramp(rust_m, 0, 1, 1, 0)
+        L(inv, met.inputs[0]); met.inputs[1].default_value = b.inputs['Metallic'].default_value
+        L(met.outputs[0], b.inputs['Metallic'])
+
+
+WEAR = 0.0
+if '--wear' in ARGS:
+    WEAR = float(ARGS[ARGS.index('--wear') + 1])
+    for _mn in (CER, CARB, MET, STL, CAB):
+        industrial_wear(MATS[_mn], WEAR)
+    print('wear', WEAR, flush=True)
 
 # ----------------------------------------------------------------------------------------------
 # mesh helpers
@@ -1637,7 +1729,7 @@ for ob in CANON:
     ob.data.uv_layers['UV_Atlas'].active_render = True
 # The bake belongs to one exact UV layout, and packing is not stable against the smallest geometry change. The layout
 # that was baked is kept beside the textures and loaded back on --reuse-bake; a topology change fails loudly.
-UV_CACHE = os.path.join(HERE, 'textures', OUT + '_uv_atlas.npz')
+UV_CACHE = os.path.join(HERE, 'textures' if NAME == OUT else 'textures_' + NAME, OUT + '_uv_atlas.npz')
 if '--reuse-bake' in ARGS and os.path.exists(UV_CACHE):
     _uvc = np.load(UV_CACHE)
     for ob in CANON:
@@ -1655,7 +1747,7 @@ print('UV', ATLAS_OK, len(ALL_OBS), 'objects', round(time.time() - T0, 1), 's')
 # ----------------------------------------------------------------------------------------------
 # bake: procedural materials -> textures/stilt_<set>_<map>.png on UV_Atlas, then plain image materials
 # ----------------------------------------------------------------------------------------------
-TEX_DIR = os.path.join(HERE, 'textures')
+TEX_DIR = os.path.join(HERE, 'textures' if NAME == OUT else 'textures_' + NAME)
 TEX = {}
 BAKE_INFO = {}
 FRAME = 'M_Stilt_Frame'
@@ -2105,10 +2197,10 @@ info = dict(
                    x_axis=[round(v, 3) for v in REST[n].to_3x3().col[0]], y_axis=[round(v, 3) for v in REST[n].to_3x3().col[1]],
                    z_axis=[round(v, 3) for v in REST[n].to_3x3().col[2]]) for n in BONE_ORDER},
     parts=info_parts)
-with open(os.path.join(HERE, OUT + '_info.json'), 'w') as fh:
+with open(os.path.join(HERE, NAME + '_info.json'), 'w') as fh:
     json.dump(info, fh, indent=1)
 print('PARTS', len(PARTS), 'BONES', len(BONE_ORDER), 'TRIS', tris_total, 'SIZE', info['size'], 'BBOX', info['bbox'])
-bpy.ops.wm.save_as_mainfile(filepath=os.path.join(HERE, OUT + '.blend'))
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(HERE, NAME + '.blend'))
 try:
     bpy.ops.file.make_paths_relative()
     bpy.ops.wm.save_mainfile()
@@ -2146,7 +2238,7 @@ if '--no-export' not in ARGS:
             o.select_set(True)
         bpy.context.view_layer.objects.active = active
     select([ARM] + ALL_OBS, ARM)
-    bpy.ops.export_scene.gltf(filepath=os.path.join(HERE, OUT + '.glb'), export_format='GLB', use_selection=True,
+    bpy.ops.export_scene.gltf(filepath=os.path.join(HERE, NAME + '.glb'), export_format='GLB', use_selection=True,
                               export_apply=False, export_skins=True, export_yup=True, export_animations=True,
                               export_animation_mode='NLA_TRACKS', export_force_sampling=True, export_frame_step=2,
                               export_image_format='JPEG', export_jpeg_quality=88, export_extras=False)
@@ -2181,7 +2273,7 @@ if '--no-export' not in ARGS:
     bpy.context.view_layer.update()
     select([ARM] + ALL_OBS, ARM)
     bpy.ops.export_scene.fbx(
-        filepath=os.path.join(HERE, OUT + '.fbx'), use_selection=True, object_types={'ARMATURE', 'MESH'},
+        filepath=os.path.join(HERE, NAME + '.fbx'), use_selection=True, object_types={'ARMATURE', 'MESH'},
         apply_unit_scale=True, apply_scale_options='FBX_SCALE_NONE', global_scale=1.0, axis_forward='-Z', axis_up='Y',
         use_mesh_modifiers=True, mesh_smooth_type='FACE', use_tspace=False, add_leaf_bones=False, primary_bone_axis='Y',
         secondary_bone_axis='X', use_armature_deform_only=False, bake_anim=True, bake_anim_use_all_bones=True,
